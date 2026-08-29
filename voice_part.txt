@@ -1,0 +1,149 @@
+﻿def send_to_chatbot(user_text):
+
+    print()
+    print("ðŸ“ Tumne kaha:")
+    print(user_text)
+
+    try:
+        response = requests.post(
+            API_URL,
+            json={
+                "message": user_text
+            },
+            timeout=60,
+        )
+
+    except requests.RequestException as error:
+
+        print()
+        print("âŒ FastAPI se connection nahi hua.")
+        print(error)
+
+        return None
+
+    if response.status_code != 200:
+
+        print()
+        print("âŒ Chatbot error:")
+        print(response.text)
+
+        return None
+
+    try:
+        data = response.json()
+    except ValueError:
+
+        print("âŒ Invalid JSON response.")
+        return None
+
+    return data.get("reply")
+
+
+# ==================================================
+# CHATBOT REPLY â†’ PIPER
+# ==================================================
+
+def speak_reply(reply):
+
+    print()
+    print("ðŸ”Š Chatbot bol raha hai...")
+    print("Reply:")
+    print(reply)
+
+    try:
+
+        command = [
+            "piper",
+            "--model",
+            PIPER_MODEL,
+            "--length_scale",
+            "1.05",
+            "--output_file",
+            str(REPLY_AUDIO_FILE),
+        ]
+
+        subprocess.run(
+            command,
+            input=reply,
+            text=True,
+            check=True,
+        )
+
+    except FileNotFoundError:
+
+        print()
+        print("âŒ Piper command nahi mila.")
+
+        return False
+
+    except subprocess.CalledProcessError as error:
+
+        print()
+        print("âŒ Piper TTS error:")
+        print(error)
+
+        return False
+
+    return True
+
+
+# ==================================================
+# PLAY VOICE
+# ==================================================
+
+def play_reply():
+
+    try:
+
+        os.startfile(
+            str(REPLY_AUDIO_FILE)
+        )
+
+    except Exception as error:
+
+        print()
+        print("âŒ Audio play nahi hui.")
+        print(error)
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+def main():
+
+    record_voice()
+
+    user_text = voice_to_text()
+
+    if not user_text:
+
+        print("âŒ Voice se text detect nahi hua.")
+
+        return
+
+    reply = send_to_chatbot(user_text)
+
+    if not reply:
+
+        return
+
+    print()
+    print("================================")
+    print("ðŸ¤– CHATBOT:")
+    print("================================")
+    print(reply)
+    print("================================")
+
+    success = speak_reply(reply)
+
+    if success:
+        play_reply()
+
+
+# ==================================================
+# START
+# ==================================================
+
+if __name__ == "__main__":
+    main()
