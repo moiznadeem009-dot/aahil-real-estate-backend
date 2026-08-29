@@ -1,5 +1,3 @@
-from pydantic import BaseModel, Field, EmailStr
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 import os
@@ -11,563 +9,16 @@ import hmac
 import json
 import secrets
 
+from pydantic import BaseModel, Field, EmailStr
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import (
-    create_engine,
-    Column,
-    Integer,
-    String,
-    Text,
-    DateTime,
-    ForeignKey,
-    UniqueConstraint,
-    Index,
-    text,
+    create_engine, Column, Integer, String, Text, DateTime, ForeignKey,
+    UniqueConstraint, Index, text,
 )
-from sqlalchemy.orm import (
-    declarative_base,
-    sessionmaker,
-    relationship,
-    Session,
-)
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None
-
-if load_dotenv:
-    load_dotenv()
-
-# =========================================================
-# CONFIGURATION
-# =========================================================
-
-APP_VERSION = "20.0.2"
-APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
-AUTH_SECRET = os.getenv("AUTH_SECRET", "").strip()
-
-if not AUTH_SECRET:
-    if APP_ENV in {"production", "prod"}:
-        raise RuntimeError("AUTH_SECRET is required when APP_ENV=production.")
-    AUTH_SECRET = "development-only-change-this-secret"
-
-AUTH_TOKEN_EXPIRE_MINUTES = 60 * 24
-
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./chatbot.db")
-
-MAX_COMPARISON_PROPERTIES = 8
-MAX_HISTORY_MESSAGES = 10
-MAX_MEMORY_ITEMS = 50
-
-# =========================================================
-# FASTAPI INITIALIZATION & CORS
-# =========================================================
-
-app = FastAPI(
-    title="Enterprise Property AI Chatbot",
-    version=APP_VERSION,
-    description=(
-        "Property AI chatbot with authentication, "
-        "memory, conversations, property search, "
-        "property comparison, lead capture and agent dashboard."
-    ),
-)
-
-# CORS Middleware Setup
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# =========================================================
-# DATABASE SETUP
-# =========================================================
-
-engine_kwargs = {"pool_pre_ping": True}
-if DATABASE_URL.startswith("sqlite"):
-    engine_kwargs["connect_args"] = {"check_same_thread": False}
-
-engine = create_engine(DATABASE_URL, **engine_kwargs)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-# =========================================================
-# DATABASE MODELS
-# =========================================================
-
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), nullable=False)
-    email = Column(String(255), unique=True, nullable=True, index=True)
-    password_hash = Column(String(512), nullable=True)
-    role = Column(String(50), nullable=False, default="customer")
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-
-    conversations = relationship("Conversation", back_populates="user", cascade="all, delete-orphan")
-    memories = relationship("Memory", back_populates="user", cascade="all, delete-orphan")
-
-
-class Conversation(Base):
-    __tablename__ = "conversations"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-
-    user = relationship("User", back_populates="conversations")
-    messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan")
-    active_property = relationship("ActiveProperty", back_populates="conversation", uselist=False, cascade="all, delete-orphan")
-    comparison = relationship("Comparison", back_populates="conversation", uselist=False, cascade="all, delete-orphan")
-
-
-class Message(Base):
-    __tablename__ = "messages"
-    id = Column(Integer, primary_key=True, index=True)
-    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
-    user_message = Column(Text, nullable=False)
-    bot_reply = Column(Text, nullable=False)
-    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-
-    conversation = relationship("Conversation", back_populates="messages")
-
-
-class Memory(Base):
-    __tablename__ = "memories"
-    __table_args__ = (
-        UniqueConstraint("user_id", "key", name="uq_user_memory_key"),
-        Index("ix_memories_user_id_key", "user_id", "key"),
-    )
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    key = Column(String(100), nullable=False)
-    value = Column(Text, nullable=False)
-    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
-
-    user = relationship("User", back_populates="memories")
-
-
-class Property(Base):
-    __tablename__ = "properties"
-    id = Column(Integer, primary_key=True, index=True)
-    title = Column(String(200), nullable=False)
-    property_type = Column(String(50), nullable=False, default="house")
-    purpose = Column(String(50), nullable=False, default="sale")
-    location = Column(String(200), nullable=False)
-    price = Column(Integer, nullable=False)
-    size_marla = Column(Integer, nullable=False)
-    bedrooms = Column(Integer, nullable=False)
-    bathrooms = Column(Integer, nullable=False)
-    description = Column(Text, nullable=False, default="")
-    status = Column(String(50), nullable=False, default="available")
-    contact_name = Column(String(100), nullable=False)
-    contact_phone = Column(String(50), nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-
-
-class ActiveProperty(Base):
-    __tablename__ = "active_properties"
-    id = Column(Integer, primary_key=True, index=True)
-    conversation_id = Column(Integer, ForeignKey("conversations.id"), unique=True, nullable=False)
-    property_id = Column(Integer, ForeignKey("properties.id"), nullable=False)
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
-
-    conversation = relationship("Conversation", back_populates="active_property")
-    property = relationship("Property")
-
-
-class Lead(Base):
-    __tablename__ = "leads"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
-    name = Column(String(100), nullable=True)
-    phone = Column(String(50), nullable=True)
-    email = Column(String(255), nullable=True)
-    budget = Column(Integer, nullable=True)
-    preferred_location = Column(String(200), nullable=True)
-    purpose = Column(String(50), nullable=True)
-    property_type = Column(String(50), nullable=True)
-    bedrooms = Column(Integer, nullable=True)
-    notes = Column(Text, nullable=True)
-    status = Column(String(50), nullable=False, default="new")
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
-
-
-class Comparison(Base):
-    __tablename__ = "comparisons"
-    id = Column(Integer, primary_key=True, index=True)
-    conversation_id = Column(Integer, ForeignKey("conversations.id"), unique=True, nullable=False)
-    property_ids = Column(Text, nullable=False)
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
-
-    conversation = relationship("Conversation", back_populates="comparison")
-
-
-# =========================================================
-# CREATE TABLES
-# =========================================================
-
-Base.metadata.create_all(bind=engine)
-
-# =========================================================
-# PYDANTIC MODELS
-# =========================================================
-
-class ChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=5000)
-
-class ChatResponse(BaseModel):
-    reply: str
-
-class RegisterRequest(BaseModel):
-    name: str = Field(min_length=2, max_length=100)
-    email: EmailStr
-    password: str = Field(min_length=8, max_length=128)
-
-class AgentRegisterRequest(BaseModel):
-    name: str = Field(min_length=2, max_length=100)
-    email: EmailStr
-    password: str = Field(min_length=8, max_length=128)
-    registration_key: str = Field(min_length=1, max_length=256)
-
-class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=8, max_length=128)
-
-class MemoryCreate(BaseModel):
-    key: str = Field(min_length=1, max_length=100)
-    value: str = Field(min_length=1, max_length=5000)
-
-class LeadCreate(BaseModel):
-    name: Optional[str] = Field(default=None, max_length=100)
-    phone: Optional[str] = Field(default=None, max_length=50)
-    email: Optional[EmailStr] = None
-    budget: Optional[int] = Field(default=None, gt=0)
-    preferred_location: Optional[str] = Field(default=None, max_length=200)
-    purpose: Optional[str] = Field(default=None, max_length=50)
-    property_type: Optional[str] = Field(default=None, max_length=50)
-    bedrooms: Optional[int] = Field(default=None, ge=0)
-    notes: Optional[str] = Field(default=None, max_length=5000)
-    status: str = Field(default="new", max_length=50)
-from pydantic import BaseModel
-from typing import Optional
-class PropertyCreate(BaseModel):
-    title: str = Field(min_length=1, max_length=200)
-    property_type: str = "house"
-    purpose: str = "sale"
-    location: str = Field(min_length=1, max_length=200)
-    price: int = Field(gt=0)
-    size_marla: int = Field(gt=0)
-    bedrooms: int = Field(ge=0)
-    bathrooms: int = Field(ge=0)
-    description: str = ""
-    status: str = "available"
-    contact_name: str = Field(min_length=1, max_length=100)
-    contact_phone: str = Field(min_length=1, max_length=50)
-
-class PropertyUpdate(PropertyCreate):
-    pass
-
-# =========================================================
-# AUTHENTICATION & SECURITY
-# =========================================================
-
-security = HTTPBearer(auto_error=False)
-
-def clean_text(value):
-    if value is None:
-        return ""
-    return str(value).strip()
-
-def normalize_email(email):
-    return clean_text(email).lower()
-
-def hash_password(password):
-    salt = secrets.token_bytes(16)
-    iterations = 310000
-    derived_key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
-    return f"pbkdf2_sha256${iterations}${base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(derived_key).decode()}"
-
-def verify_password(password, stored_hash):
-    try:
-        algorithm, iterations, salt_b64, hash_b64 = stored_hash.split("$", 3)
-        if algorithm != "pbkdf2_sha256":
-            return False
-        salt = base64.urlsafe_b64decode(salt_b64.encode())
-        expected = base64.urlsafe_b64decode(hash_b64.encode())
-        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iterations))
-        return hmac.compare_digest(actual, expected)
-    except Exception:
-        return False
-
-def _b64url(data):
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
-
-def _b64url_decode(value):
-    padding = "=" * (-len(value) % 4)
-    return base64.urlsafe_b64decode((value + padding).encode("ascii"))
-
-def create_access_token(user_id, role):
-    now = datetime.now(timezone.utc)
-    payload = {
-        "sub": str(user_id),
-        "role": role,
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(minutes=AUTH_TOKEN_EXPIRE_MINUTES)).timestamp()),
-    }
-    header = {"alg": "HS256", "typ": "JWT"}
-    encoded_header = _b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
-    encoded_payload = _b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-    signing_input = f"{encoded_header}.{encoded_payload}".encode("ascii")
-    signature = hmac.new(AUTH_SECRET.encode("utf-8"), signing_input, hashlib.sha256).digest()
-    return f"{encoded_header}.{encoded_payload}.{_b64url(signature)}"
-
-def decode_access_token(token):
-    try:
-        parts = token.split(".")
-        if len(parts) != 3:
-            return None
-        encoded_header, encoded_payload, encoded_signature = parts
-        signing_input = f"{encoded_header}.{encoded_payload}".encode("ascii")
-        expected_signature = hmac.new(AUTH_SECRET.encode("utf-8"), signing_input, hashlib.sha256).digest()
-        actual_signature = _b64url_decode(encoded_signature)
-        if not hmac.compare_digest(expected_signature, actual_signature):
-            return None
-        payload = json.loads(_b64url_decode(encoded_payload).decode("utf-8"))
-        if payload.get("exp", 0) <= int(datetime.now(timezone.utc).timestamp()):
-            return None
-        if not payload.get("sub"):
-            return None
-        return payload
-    except Exception:
-        return None
-
-def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
-    if not credentials or credentials.scheme.lower() != "bearer":
-        return 1  # Fallback guest ID
-    payload = decode_access_token(credentials.credentials)
-    if not payload:
-        return 1
-    try:
-        return int(payload["sub"])
-    except Exception:
-        return 1
-
-def require_roles(*allowed_roles):
-    def dependency(current_user_id: int = Depends(get_current_user)):
-        db = SessionLocal()
-        try:
-            user = db.query(User).filter(User.id == current_user_id).first()
-            if not user:
-                user = User(id=1, name="Guest Customer", email="guest@chatbot.local", role="customer")
-                db.add(user)
-                db.commit()
-
-            role = user.role or "customer"
-            if role not in allowed_roles:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Access denied. Admins/Agents only.",
-                )
-            return current_user_id
-        finally:
-            db.close()
-    return dependency
-
-# =========================================================
-# HELPERS & UTILS
-# =========================================================
-
-def money_lakh(price):
-    try:
-        return round(float(price) / 100000, 2)
-    except Exception:
-        return 0
-
-def property_to_dict(property_obj):
-    if not property_obj:
-        return None
-    return {
-        "id": property_obj.id,
-        "title": property_obj.title,
-        "property_type": property_obj.property_type,
-        "purpose": property_obj.purpose,
-        "location": property_obj.location,
-        "price": property_obj.price,
-        "price_lakh": money_lakh(property_obj.price),
-        "size_marla": property_obj.size_marla,
-        "bedrooms": property_obj.bedrooms,
-        "bathrooms": property_obj.bathrooms,
-        "description": property_obj.description,
-        "status": property_obj.status,
-        "contact_name": property_obj.contact_name,
-        "contact_phone": property_obj.contact_phone,
-        "created_at": property_obj.created_at,
-    }
-
-# =========================================================
-# API ENDPOINTS (AUTH & CHAT)
-# =========================================================
-
-@app.get("/health")
-def health():
-    db = SessionLocal()
-    try:
-        db.execute(text("SELECT 1"))
-        return {"status": "ok", "version": APP_VERSION, "database": "connected"}
-    finally:
-        db.close()
-
-@app.get("/")
-def home():
-    return {"message": "Enterprise Property AI Chatbot is running!", "version": APP_VERSION}
-
-@app.post("/auth/register")
-def register(request: RegisterRequest):
-    db = SessionLocal()
-    try:
-        email = normalize_email(request.email)
-        if db.query(User).filter(User.email == email).first():
-            raise HTTPException(status_code=409, detail="Email already exists.")
-        user = User(
-            name=clean_text(request.name),
-            email=email,
-            password_hash=hash_password(request.password),
-            role="customer",
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-        token = create_access_token(user.id, user.role)
-        return {"message": "Registered successfully.", "access_token": token, "token_type": "bearer", "user": {"id": user.id, "role": user.role}}
-    finally:
-        db.close()
-
-@app.post("/auth/login")
-def login(request: LoginRequest):
-    db = SessionLocal()
-    try:
-        email = normalize_email(request.email)
-        user = db.query(User).filter(User.email == email).first()
-        if not user or not verify_password(request.password, user.password_hash):
-            raise HTTPException(status_code=401, detail="Invalid email or password.")
-        token = create_access_token(user.id, user.role or "customer")
-        return {
-            "message": "Login successful.",
-            "access_token": token,
-            "token_type": "bearer",
-            "user": {"id": user.id, "name": user.name, "email": user.email, "role": user.role or "customer"},
-        }
-    finally:
-        db.close()
-
-@app.get("/auth/me")
-def auth_me(current_user_id: int = Depends(get_current_user)):
-    db = SessionLocal()
-    try:
-        user = db.query(User).filter(User.id == current_user_id).first()
-        if not user:
-            return {"id": 1, "name": "Guest Customer", "role": "customer"}
-        return {"id": user.id, "name": user.name, "email": user.email, "role": user.role or "customer"}
-    finally:
-        db.close()
-
-@app.get("/properties")
-def get_properties():
-    db = SessionLocal()
-    try:
-        properties = db.query(Property).all()
-        return {"count": len(properties), "properties": [property_to_dict(p) for p in properties]}
-    finally:
-        db.close()
-
-@app.post("/properties/")
-def create_property(property_data: PropertyCreate, db: Session = Depends(get_db)):
-    db_property = Property(
-        title=property_data.title,
-        description=property_data.description,
-        price=property_data.price,
-        location=property_data.location,
-        size=property_data.size  # Yahan proper assignment honi chahiye
-    )
-    db.add(db_property)
-    db.commit()
-    db.refresh(db_property)
-    return db_property
-
-# =========================================================
-# RUN SERVER
-# =========================================================
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8002, reload=False)
-
-# =========================================================
-# PROPERTIES ENDPOINT
-# =========================================================
-
-@app.get("/properties")
-def get_properties(db: Session = Depends(get_db)):
-    try:
-        # Agar aapka model 'Property' ya 'PropertyModel' hai, yahan check kar lein
-        properties = db.query(Property).all()
-        return properties
-    except Exception as e:
-        return []
-from sqlalchemy import (
-    create_engine,
-    Column,
-    Integer,
-    String,
-    Text,
-    DateTime,
-    ForeignKey,
-    UniqueConstraint,
-    Index,
-    text,
-)
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import (
-    declarative_base,
-    sessionmaker,
-    relationship,
-)
-app = FastAPI()
-
-# 2. Yeh raha CORS middleware jo aapko add karna hai
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5175", "http://192.168.100.15:5175", "http://localhost:5173", "http://192.168.100.15:5173"],  # Specific origins dein jo aap use kar rahe hain
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-
-)
-from datetime import datetime, timedelta, timezone
-from typing import Optional
-
-import requests
-import re
-import os
-import base64
-import hashlib
 import hmac
 import json
 import secrets
@@ -584,10 +35,11 @@ if load_dotenv:
 # CONFIGURATION
 # =========================================================
 
-APP_VERSION = "20.0.2"
+APP_VERSION = "20.0.3"
 
 APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
 AUTH_SECRET = os.getenv("AUTH_SECRET", "").strip()
+AGENT_REGISTRATION_KEY = os.getenv("AGENT_REGISTRATION_KEY", "").strip()
 
 if not AUTH_SECRET:
     if APP_ENV in {"production", "prod"}:
@@ -599,6 +51,9 @@ if not AUTH_SECRET:
         "WARNING: AUTH_SECRET is using the development fallback. "
         "Set AUTH_SECRET in your .env before production."
     )
+
+if not AGENT_REGISTRATION_KEY:
+    AGENT_REGISTRATION_KEY = AUTH_SECRET
 
 AUTH_TOKEN_EXPIRE_MINUTES = 60 * 24
 
@@ -637,9 +92,32 @@ app = FastAPI(
 )
 
 # 👇 Yeh wala block bilkul yahan FastAPI() initialize hone ke foran baad hona chahiye (sabse upar)
+# Production + local frontend origins.
+# The Vercel production origin is included explicitly so CORS still works
+# even if Railway has an older CORS_ORIGINS environment variable set.
+DEFAULT_CORS_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+    "http://127.0.0.1:5175",
+    "https://real-estate-frontend-ruby-eight.vercel.app",
+]
+
+CONFIGURED_CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "").split(",")
+    if origin.strip()
+]
+
+CORS_ORIGINS = list(dict.fromkeys(
+    DEFAULT_CORS_ORIGINS + CONFIGURED_CORS_ORIGINS
+))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1063,6 +541,30 @@ class Comparison(Base):
 # =========================================================
 
 Base.metadata.create_all(bind=engine)
+
+
+def ensure_guest_user():
+    db = SessionLocal()
+    try:
+        if not db.query(User).filter(User.id == 1).first():
+            db.add(
+                User(
+                    id=1,
+                    name="Guest Customer",
+                    email="guest@chatbot.local",
+                    password_hash=None,
+                    role="customer",
+                )
+            )
+            db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+ensure_guest_user()
 
 
 # =========================================================
@@ -2775,11 +2277,22 @@ def asks_property_search(text):
         for location in known_locations
     )
 
+    has_budget = bool(parse_pakistani_amounts(lower))
+    has_bedroom = bool(
+        re.search(r"\b\d+\s*(?:bedrooms?|beds?)\b", lower)
+    )
+    has_bathroom = bool(
+        re.search(r"\b\d+\s*(?:bathrooms?|baths?)\b", lower)
+    )
+    has_size = bool(
+        re.search(r"\b\d+(?:\.\d+)?\s*marla\b", lower)
+    )
+
     return (
-        has_property_word
-        and (
-            has_search_word
-            or has_location
+        (has_property_word and (has_search_word or has_location))
+        or (
+            has_property_word
+            and (has_budget or has_bedroom or has_bathroom or has_size)
         )
     )
 
@@ -3986,7 +3499,7 @@ def register_agent(
 
     if not hmac.compare_digest(
         request.registration_key,
-        AUTH_SECRET,
+        AGENT_REGISTRATION_KEY,
     ):
         raise HTTPException(
             status_code=403,
@@ -4211,55 +3724,40 @@ def auth_me(
 # CREATE CONVERSATION
 # =========================================================
 
-@app.post(
-    "/conversations/{user_id}"
-)
+@app.post("/conversations/{user_id}")
 def create_conversation(
     user_id: int,
-    current_user_id: int = Depends(
-        get_current_user
-    ),
+    current_user_id: int = Depends(get_current_user),
 ):
-
     db = SessionLocal()
-
     try:
-
-        user = (
-            db.query(User)
-            .filter(
-                User.id == user_id
+        if user_id != current_user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="You can only create conversations for your own account.",
             )
-            .first()
-        )
 
+        user = db.query(User).filter(User.id == user_id).first()
         if not user:
-            # Agar user na ho toh create kar dein taake request fail na ho
-            user = User(id=user_id, name="Customer", email=f"user{user_id}@chatbot.local", role="customer")
-            db.add(user)
-            db.commit()
+            raise HTTPException(status_code=404, detail="User not found.")
 
-        conversation = Conversation(
-            user_id=user_id
-        )
-
+        conversation = Conversation(user_id=user_id)
         db.add(conversation)
         db.commit()
         db.refresh(conversation)
 
         return {
-            "conversation_id":
-                conversation.id,
-
-            "user_id":
-                user_id,
-
-            "created_at":
-                conversation.created_at,
+            "conversation_id": conversation.id,
+            "user_id": conversation.user_id,
+            "created_at": conversation.created_at,
         }
-
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        print("CREATE CONVERSATION ERROR:", repr(exc))
+        raise HTTPException(status_code=500, detail="Conversation creation failed.")
     finally:
-
         db.close()
 
 
@@ -4267,84 +3765,53 @@ def create_conversation(
 # CHAT
 # =========================================================
 
-@app.post(
-    "/chat/{conversation_id}",
-    response_model=ChatResponse,
-)
+@app.post("/chat/{conversation_id}", response_model=ChatResponse)
 def chat(
     conversation_id: int,
     request: ChatRequest,
-    current_user_id: int = Depends(
-        get_current_user
-    ),
+    current_user_id: int = Depends(get_current_user),
 ):
-
     db = SessionLocal()
-
     try:
-
         conversation = (
             db.query(Conversation)
             .filter(
-                Conversation.id
-                == conversation_id
+                Conversation.id == conversation_id,
+                Conversation.user_id == current_user_id,
             )
             .first()
         )
-
         if not conversation:
-            # Agar conversation exist nahi karti toh automatically create kar dein taake customer ko token/login ki zaroorat na pare
-            conversation = Conversation(id=conversation_id, user_id=current_user_id)
-            db.add(conversation)
-            db.commit()
-            db.refresh(conversation)
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found.",
+            )
 
-        message_text = clean_text(
-            request.message
-        )
-
+        message_text = clean_text(request.message)
         reply = generate_reply(
             db=db,
             user_id=conversation.user_id,
-            conversation_id=conversation_id,
+            conversation_id=conversation.id,
             message=message_text,
         )
 
-        message = Message(
-            conversation_id=conversation_id,
-            user_message=message_text,
-            bot_reply=reply,
+        db.add(
+            Message(
+                conversation_id=conversation.id,
+                user_message=message_text,
+                bot_reply=reply,
+            )
         )
-
-        db.add(message)
         db.commit()
 
-        return ChatResponse(
-            reply=reply
-        )
-
+        return ChatResponse(reply=reply)
     except HTTPException:
-
         raise
-
     except Exception as exc:
-
         db.rollback()
-
-        print(
-            "CHAT ERROR:",
-            repr(exc),
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Chat processing error."
-            ),
-        )
-
+        print("CHAT ERROR:", repr(exc))
+        raise HTTPException(status_code=500, detail="Chat processing error.")
     finally:
-
         db.close()
 
 
